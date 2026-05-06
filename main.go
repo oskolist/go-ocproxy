@@ -21,7 +21,7 @@ import (
 const Version = "1.1.0 (Go-gVisor rewrite)"
 
 func main() {
-	socksPort := flag.String("D", "1080", "SOCKS5 dynamic port forward")
+	socksPort := flag.String("D", "1080", "Listen port for SOCKS5/HTTP proxy (auto-sniffed)")
 	showVersion := flag.Bool("V", false, "Show version")
 	localIP := flag.String("ip", "", "Internal IPv4 address")
 	mtu := flag.Int("mtu", 1500, "MTU")
@@ -57,7 +57,7 @@ func main() {
 	log.Printf("[main] -----------------------------------------")
 	log.Printf("[main]   go-ocproxy %s", Version)
 	log.Printf("[main] -----------------------------------------")
-	log.Printf("[main] Listening:     %s (SOCKS5)", listenAddr)
+	log.Printf("[main] Listening:     %s (SOCKS5/HTTP)", listenAddr)
 	log.Printf("[main] Internal IP:   %s", *localIP)
 	log.Printf("[main] MTU:           %d", *mtu)
 	log.Printf("[main] DNS Servers:   %v", dnsServers)

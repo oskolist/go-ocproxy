@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-`go-ocproxy` 是对原版 `ocproxy` 的现代 Go 语言重写。它能与 `openconnect` 协议配合，通过用户态网络协议栈将 VPN 流量转化为本地 SOCKS5 代理，从而避免污染全局路由。
+`go-ocproxy` 是对原版 `ocproxy` 的现代 Go 语言重写。它能与 `openconnect` 协议配合，通过用户态网络协议栈将 VPN 流量转化为本地代理，从而避免污染全局路由。**同一端口同时支持 SOCKS5 与 HTTP 代理**，按首字节自动嗅探协议，浏览器无需区分配置。
 
 ## 🚀 为什么选择 go-ocproxy？
 
@@ -19,6 +19,7 @@
 
 ## ✨ 核心功能
 - [x] **SOCKS5 代理**：默认监听 `127.0.0.1:1080`，转发 TCP 流量。
+- [x] **HTTP 代理（同端口）**：同一端口自动嗅探 HTTP 请求，支持 `CONNECT`（HTTPS 隧道）与普通 HTTP 转发（绝对 URI、自动剥离 hop-by-hop 头）。浏览器把 HTTP/HTTPS 代理都填这一个端口即可。
 - [x] **内网 DNS 转发**：自动识别并利用 VPN 内部 DNS 进行域名解析。
 - [x] **自动配置集成**：完美继承 `openconnect` 分配的 IP、MTU 和 DNS 环境变量。
 - [x] **稳定流处理**：精确的 IP 数据包边界处理，确保长连接稳定性。
@@ -35,19 +36,24 @@ go build -o go-ocproxy
 ```bash
 sudo openconnect \
     --script-tun \
-    --script "./go-ocproxy -socks 127.0.0.1:1080" \
+    --script "./go-ocproxy -D 1080" \
     vpn.example.com
 ```
+
+监听端口同时接受 SOCKS5 和 HTTP 代理请求。浏览器配置示例（macOS 系统代理）：
+- HTTP 代理：`127.0.0.1:1080`
+- HTTPS 代理：`127.0.0.1:1080`
+- SOCKS 代理：`127.0.0.1:1080`
 
 ### 命令行参数
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
-| `-D` | SOCKS5 监听端口 | `1080` |
+| `-D` | SOCKS5/HTTP 代理监听端口（同端口嗅探） | `1080` |
 | `-ip` | 手动指定内部 IPv4 地址（通常自动获取） | 无 |
 | `-mtu` | 手动指定 MTU 大小（通常自动获取） | `1500` |
-| `-o` | 默认 DNS 域名后缀（CISCO_DEF_DOMAIN） | 无 |
-| `-k` | TCP keepalive 间隔（秒，0=禁用） | `0` |
-| `-V` | 显示版本号 | – |
+| `-o` | DNS 默认域名后缀（覆盖 `CISCO_DEF_DOMAIN`） | 无 |
+| `-k` | TCP keepalive 间隔（秒），0 关闭 | `0` |
+| `-V` | 打印版本并退出 | — |
 
 ## 📚 给开发者 / 贡献者
 

@@ -1,6 +1,7 @@
 package socks
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -21,6 +22,15 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
+
+// bufferedConn 把已经预读的字节继续暴露给后续 Read 调用，
+// 这样嗅探首字节后仍能透明地交给协议处理函数。
+type bufferedConn struct {
+	r *bufio.Reader
+	net.Conn
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -304,15 +314,34 @@ func socksReply(conn net.Conn, rep byte) error {
 	return err
 }
 
-func (s *Server) handle(conn net.Conn) {
-	defer conn.Close()
-	start := time.Now()
-	remote := conn.RemoteAddr().String()
+func (s *Server) handle(rawConn net.Conn) {
+	defer rawConn.Close()
 
 	s.Stats.connOpened()
 	defer s.Stats.connClosed()
 
-	conn.SetDeadline(time.Now().Add(socksHandshakeTimeout))
+	rawConn.SetDeadline(time.Now().Add(socksHandshakeTimeout))
+
+	br := bufio.NewReader(rawConn)
+	first, err := br.Peek(1)
+	if err != nil {
+		log.Printf("[proxy] %s peek failed: %v", rawConn.RemoteAddr(), err)
+		return
+	}
+	conn := &bufferedConn{r: br, Conn: rawConn}
+
+	// 嗅探：HTTP 方法首字节必为大写 ASCII 字母（GET/POST/HEAD/CONNECT/PUT/...），
+	// 其余一律交给 SOCKS5 处理 —— version 不是 0x05 时 handler 会回 {0x05, 0xFF}。
+	if first[0] >= 'A' && first[0] <= 'Z' {
+		s.handleHTTP(conn, br)
+	} else {
+		s.handleSOCKS5(conn)
+	}
+}
+
+func (s *Server) handleSOCKS5(conn net.Conn) {
+	start := time.Now()
+	remote := conn.RemoteAddr().String()
 
 	buf := make([]byte, 1024)
 
@@ -438,8 +467,7 @@ func (s *Server) handle(conn net.Conn) {
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), socksDialTimeout)
 	defer dialCancel()
 
-	addr := tcpip.AddrFrom4([4]byte(targetIP4[:4]))
-	tunnel, err := s.ns.DialTCP(dialCtx, &tcpip.FullAddress{Addr: addr, Port: port})
+	tunnel, err := s.dialNetstack(dialCtx, targetIP4, port)
 	if err != nil {
 		log.Printf("[socks] %s dial %s:%d failed: %v", remote, host, port, err)
 		socksReply(conn, socksRepHostUnrch)
@@ -453,36 +481,63 @@ func (s *Server) handle(conn net.Conn) {
 	}
 
 	// --- 4. Bidirectional copy with half-close ---
-	//
-	// 字节计数用 atomic 而非局部变量：原本 `var bytesIn, bytesOut int64` + 子
-	// goroutine 写、main goroutine 读，虽然靠 channel 提供了 happens-before，
-	// 但用 -race 仍可能误报，且语义脆弱。换 atomic.Int64 一劳永逸。
-	//
-	// sync.WaitGroup.Go (Go 1.25) 替代 errCh + 两次 <-errCh 的样板。
+	bytesIn, bytesOut := bidirectionalCopy(conn, tunnel)
+
+	s.Stats.BytesIn.Add(bytesIn)
+	s.Stats.BytesOut.Add(bytesOut)
+
+	dur := time.Since(start).Round(time.Millisecond)
+	log.Printf("[socks] %s -> %s closed, duration=%s in=%d out=%d", remote, host, dur, bytesIn, bytesOut)
+}
+
+// dialNetstack 用解析后的 IPv4 通过 gVisor NetStack 建立 TCP。
+func (s *Server) dialNetstack(ctx context.Context, ip4 net.IP, port uint16) (net.Conn, error) {
+	addr := tcpip.AddrFrom4([4]byte(ip4[:4]))
+	return s.ns.DialTCP(ctx, &tcpip.FullAddress{Addr: addr, Port: port})
+}
+
+// resolveAndDial 接受字面量 IP 或域名，解析为 IPv4 后通过 NetStack 建连。
+func (s *Server) resolveAndDial(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	var ip net.IP
+	if parsed := net.ParseIP(host); parsed != nil {
+		ip = parsed
+	} else {
+		resolved, err := s.resolve(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s: %w", host, err)
+		}
+		ip = resolved
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return nil, fmt.Errorf("%s is not IPv4", ip)
+	}
+	return s.dialNetstack(ctx, ip4, port)
+}
+
+// bidirectionalCopy 在两个连接间双向拷贝，遇到一端 EOF 时半关闭对侧写端。
+//
+// 字节计数用 atomic.Int64 而非局部变量：sync.WaitGroup.Wait 提供了
+// happens-before，但 -race 仍可能误报，atomic 一劳永逸。
+func bidirectionalCopy(client, tunnel net.Conn) (int64, int64) {
 	var bytesIn, bytesOut atomic.Int64
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		n, _ := io.Copy(tunnel, conn)
+		n, _ := io.Copy(tunnel, client)
 		bytesIn.Store(n)
 		if cw, ok := tunnel.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
 	})
 	wg.Go(func() {
-		n, _ := io.Copy(conn, tunnel)
+		n, _ := io.Copy(client, tunnel)
 		bytesOut.Store(n)
-		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		if cw, ok := client.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
 	})
 	wg.Wait()
-
-	bin, bout := bytesIn.Load(), bytesOut.Load()
-	s.Stats.BytesIn.Add(bin)
-	s.Stats.BytesOut.Add(bout)
-
-	dur := time.Since(start).Round(time.Millisecond)
-	log.Printf("[socks] %s -> %s closed, duration=%s in=%d out=%d", remote, host, dur, bin, bout)
+	return bytesIn.Load(), bytesOut.Load()
 }
 
 // ---------------------------------------------------------------------------

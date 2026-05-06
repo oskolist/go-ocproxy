@@ -1,10 +1,13 @@
 package socks
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"io"
 	"net"
+	"net/http"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -556,7 +559,6 @@ func TestDumpStats(t *testing.T) {
 	s.DumpStats() // 不 panic 就 pass
 }
 
-// ===========================================================================
 // cacheCleanupLoop — 用 testing/synctest（Go 1.25 stable）测周期触发
 // ===========================================================================
 //
@@ -609,4 +611,132 @@ func TestCacheCleanupLoop(t *testing.T) {
 		cancel()
 		<-done
 	})
+}
+
+// ===========================================================================
+// HTTP proxy & sniffing
+// ===========================================================================
+
+// HT-PROTO-1: 同端口嗅探 — 非 0x05 的请求不应再走 SOCKS5 协议（不会回 0x05/0xFF）
+func TestHTTPSniffNotSOCKS(t *testing.T) {
+	_, addr := setupTestServer(t)
+	conn := dialTest(t, addr)
+	defer conn.Close()
+
+	// 发一个明显不是 SOCKS 的字节，强制走 HTTP 分支
+	conn.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response line: %v", err)
+	}
+	if !strings.HasPrefix(line, "HTTP/1.1 ") {
+		t.Errorf("expected HTTP status line, got %q", line)
+	}
+}
+
+// HT-PROTO-2: 非代理请求（相对 URI，无 host）应回 400
+func TestHTTPNonProxyRequest(t *testing.T) {
+	_, addr := setupTestServer(t)
+	conn := dialTest(t, addr)
+	defer conn.Close()
+
+	conn.Write([]byte("GET /local-path HTTP/1.1\r\nHost: example.com\r\n\r\n"))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Errorf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+// HT-PROTO-3: CONNECT 到非 IPv4 字面量（IPv6）应快速回 502
+func TestHTTPConnectIPv6Rejected(t *testing.T) {
+	_, addr := setupTestServer(t)
+	conn := dialTest(t, addr)
+	defer conn.Close()
+
+	conn.Write([]byte("CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\n"))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 502 {
+		t.Errorf("expected 502, got %d", resp.StatusCode)
+	}
+}
+
+// HT-PROTO-4: CONNECT 端口非法应快速回 400
+func TestHTTPConnectBadPort(t *testing.T) {
+	_, addr := setupTestServer(t)
+	conn := dialTest(t, addr)
+	defer conn.Close()
+
+	conn.Write([]byte("CONNECT example.com:abc HTTP/1.1\r\nHost: example.com:abc\r\n\r\n"))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Errorf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+// HT-UNIT-1: hop-by-hop 头剥离
+func TestRemoveHopByHopHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("Connection", "X-Custom, Keep-Alive")
+	h.Set("Keep-Alive", "timeout=5")
+	h.Set("Proxy-Connection", "keep-alive")
+	h.Set("Proxy-Authorization", "Basic xxx")
+	h.Set("X-Custom", "should-be-removed")
+	h.Set("X-Keep", "should-stay")
+
+	removeHopByHopHeaders(h)
+
+	for _, k := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "Proxy-Authorization", "X-Custom"} {
+		if h.Get(k) != "" {
+			t.Errorf("%s 应被剥离，仍为 %q", k, h.Get(k))
+		}
+	}
+	if h.Get("X-Keep") != "should-stay" {
+		t.Errorf("X-Keep 不该被删")
+	}
+}
+
+// HT-UNIT-2: splitHostPortDefault
+func TestSplitHostPortDefault(t *testing.T) {
+	cases := []struct {
+		in       string
+		defaultP string
+		host     string
+		port     uint16
+		wantErr  bool
+	}{
+		{"example.com:443", "80", "example.com", 443, false},
+		{"example.com", "443", "example.com", 443, false},
+		{"127.0.0.1:8080", "80", "127.0.0.1", 8080, false},
+		{"example.com:abc", "80", "", 0, true},
+	}
+	for _, c := range cases {
+		host, port, err := splitHostPortDefault(c.in, c.defaultP)
+		if (err != nil) != c.wantErr {
+			t.Errorf("%q: err=%v wantErr=%v", c.in, err, c.wantErr)
+			continue
+		}
+		if c.wantErr {
+			continue
+		}
+		if host != c.host || port != c.port {
+			t.Errorf("%q: got (%s,%d), want (%s,%d)", c.in, host, port, c.host, c.port)
+		}
+	}
 }

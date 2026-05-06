@@ -2,7 +2,7 @@
 
 English | [简体中文](README_zh.md)
 
-`go-ocproxy` is a modern, Go-based rewrite of the original `ocproxy`. It works seamlessly with `openconnect` to provide a user-space SOCKS5 proxy for VPN traffic, preventing global routing pollution.
+`go-ocproxy` is a modern, Go-based rewrite of the original `ocproxy`. It works seamlessly with `openconnect` to provide a user-space proxy for VPN traffic, preventing global routing pollution. **A single port serves both SOCKS5 and HTTP proxy** — the protocol is auto-detected from the first byte, so browsers can use the same address for HTTP, HTTPS, and SOCKS.
 
 ## 🚀 Why go-ocproxy?
 
@@ -19,6 +19,7 @@ The original `ocproxy` is written in C and carries roughly 80,000 lines of code,
 
 ## ✨ Features
 - [x] **SOCKS5 Proxy**: Listens on `127.0.0.1:1080` by default.
+- [x] **HTTP Proxy (same port)**: Auto-sniffs HTTP requests on the same port. Supports `CONNECT` (HTTPS tunneling) and absolute-URI HTTP forwarding with automatic hop-by-hop header stripping.
 - [x] **Internal DNS Forwarding**: Resolves domains using VPN DNS servers automatically.
 - [x] **Auto-Config**: Inherits `INTERNAL_IP4_ADDRESS`, `MTU`, and `DNS` from `openconnect` environment variables.
 - [x] **Packet Boundary Logic**: Robust handling of IP packet streams for stable long-lived connections.
@@ -35,19 +36,21 @@ Run it as an `openconnect` script:
 ```bash
 sudo openconnect \
     --script-tun \
-    --script "./go-ocproxy -socks 127.0.0.1:1080" \
+    --script "./go-ocproxy -D 1080" \
     vpn.example.com
 ```
+
+The listening port accepts both SOCKS5 and HTTP proxy connections. In your browser/system proxy settings, point HTTP, HTTPS, and SOCKS all at `127.0.0.1:1080`.
 
 ### CLI Arguments
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `-D` | SOCKS5 listen port | `1080` |
+| `-D` | SOCKS5/HTTP proxy listen port (same port, auto-sniffed) | `1080` |
 | `-ip` | Manually specify internal IPv4 address (usually auto-detected) | None |
 | `-mtu` | Manually specify MTU (usually auto-detected) | `1500` |
-| `-o` | Default DNS domain suffix (CISCO_DEF_DOMAIN) | None |
-| `-k` | TCP keepalive interval in seconds (0=disabled) | `0` |
-| `-V` | Show version | – |
+| `-o` | Default DNS domain suffix (overrides `CISCO_DEF_DOMAIN`) | None |
+| `-k` | TCP keepalive interval in seconds (0 to disable) | `0` |
+| `-V` | Print version and exit | — |
 
 ## 📚 For Developers / Contributors
 
