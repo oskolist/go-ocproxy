@@ -18,6 +18,10 @@
   情况下都不再因瞬时错误退出 goroutine**。
 
 ### Added
+- **IPv6 双栈支持**：当 openconnect 通过 `INTERNAL_IP6_ADDRESS` 传入 IPv6 地址时，
+  go-ocproxy 可以转发 IPv6 流量。SOCKS5 ATYP=0x04 (IPv6) 不再被拒绝，DNS 解析在
+  A 记录无结果时回退到 AAAA 记录。IPv6 完全可选——不配置时行为不变。新增 `-ip6`
+  CLI 参数和 `INTERNAL_IP6_DNS` 环境变量支持。
 - 启动时显式调大 VPN fd 的 `SO_SNDBUF` / `SO_RCVBUF` 至 1 MiB（macOS 默认 AF_UNIX
   SOCK_DGRAM 仅约 8 KiB），降低 ENOBUFS 触发概率。
 - `stack/stack_test.go` 新增 7 个测试覆盖 `writeOutboundWithRetry` 的所有分支

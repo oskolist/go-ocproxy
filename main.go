@@ -24,6 +24,7 @@ func main() {
 	socksPort := flag.String("D", "1080", "Listen port for SOCKS5/HTTP proxy (auto-sniffed)")
 	showVersion := flag.Bool("V", false, "Show version")
 	localIP := flag.String("ip", "", "Internal IPv4 address")
+	localIP6 := flag.String("ip6", "", "Internal IPv6 address")
 	mtu := flag.Int("mtu", 1500, "MTU")
 	dnsDomain := flag.String("o", "", "Default DNS domain suffix (CISCO_DEF_DOMAIN)")
 	keepalive := flag.Int("k", 0, "TCP keepalive interval in seconds (0=disabled)")
@@ -39,6 +40,8 @@ func main() {
 		log.Fatal("[main] Internal IP address not set. Use -ip or run via openconnect.")
 	}
 
+	*localIP6 = cmp.Or(*localIP6, os.Getenv("INTERNAL_IP6_ADDRESS"))
+
 	if envMTU := os.Getenv("INTERNAL_IP4_MTU"); envMTU != "" {
 		if m, err := strconv.Atoi(envMTU); err == nil {
 			*mtu = m
@@ -48,6 +51,9 @@ func main() {
 	var dnsServers []string
 	if envDNS := os.Getenv("INTERNAL_IP4_DNS"); envDNS != "" {
 		dnsServers = strings.Fields(envDNS)
+	}
+	if envDNS6 := os.Getenv("INTERNAL_IP6_DNS"); envDNS6 != "" {
+		dnsServers = append(dnsServers, strings.Fields(envDNS6)...)
 	}
 
 	*dnsDomain = cmp.Or(*dnsDomain, os.Getenv("CISCO_DEF_DOMAIN"))
@@ -59,6 +65,9 @@ func main() {
 	log.Printf("[main] -----------------------------------------")
 	log.Printf("[main] Listening:     %s (SOCKS5/HTTP)", listenAddr)
 	log.Printf("[main] Internal IP:   %s", *localIP)
+	if *localIP6 != "" {
+		log.Printf("[main] Internal IPv6: %s", *localIP6)
+	}
 	log.Printf("[main] MTU:           %d", *mtu)
 	log.Printf("[main] DNS Servers:   %v", dnsServers)
 	if *dnsDomain != "" {
@@ -68,7 +77,7 @@ func main() {
 		log.Printf("[main] TCP Keepalive: %ds", *keepalive)
 	}
 
-	ns, err := stack.NewNetStack(*localIP, uint32(*mtu))
+	ns, err := stack.NewNetStack(*localIP, uint32(*mtu), *localIP6)
 	if err != nil {
 		log.Fatalf("[main] Failed to initialize netstack: %v", err)
 	}

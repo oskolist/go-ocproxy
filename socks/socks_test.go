@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/awkj/go-ocproxy/stack"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // ===========================================================================
@@ -155,7 +156,7 @@ func TestDNSCacheEvictExpired(t *testing.T) {
 // ===========================================================================
 
 func TestBuildDNSQuery(t *testing.T) {
-	q, err := buildDNSQuery("www.example.com", 0x1234)
+	q, err := buildDNSQuery("www.example.com", 0x1234, dnsmessage.TypeA)
 	if err != nil {
 		t.Fatalf("buildDNSQuery: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestBuildDNSQuery(t *testing.T) {
 }
 
 func TestBuildDNSQueryInvalidLabel(t *testing.T) {
-	_, err := buildDNSQuery("", 1)
+	_, err := buildDNSQuery("", 1, dnsmessage.TypeA)
 	if err == nil {
 		t.Error("expected error for empty name")
 	}
@@ -248,6 +249,60 @@ func TestParseDNSResponseRcode(t *testing.T) {
 	}
 }
 
+func TestBuildDNSQueryAAAA(t *testing.T) {
+	q, err := buildDNSQuery("example.com", 0x5678, dnsmessage.TypeAAAA)
+	if err != nil {
+		t.Fatalf("buildDNSQuery AAAA: %v", err)
+	}
+	if binary.BigEndian.Uint16(q[0:2]) != 0x5678 {
+		t.Error("wrong ID")
+	}
+	// QTYPE=28 (AAAA) 位于 Question 末尾
+	off := 12
+	for q[off] != 0 {
+		off += int(q[off]) + 1
+	}
+	off++ // skip root label
+	qtype := binary.BigEndian.Uint16(q[off : off+2])
+	if qtype != 28 {
+		t.Errorf("expected QTYPE=28 (AAAA), got %d", qtype)
+	}
+}
+
+func TestParseDNSResponseAAAA(t *testing.T) {
+	resp := make([]byte, 0, 80)
+	resp = binary.BigEndian.AppendUint16(resp, 0xBEEF) // ID
+	resp = binary.BigEndian.AppendUint16(resp, 0x8180) // Flags: response, no error
+	resp = binary.BigEndian.AppendUint16(resp, 1)      // QDCOUNT
+	resp = binary.BigEndian.AppendUint16(resp, 1)      // ANCOUNT
+	resp = binary.BigEndian.AppendUint16(resp, 0)      // NSCOUNT
+	resp = binary.BigEndian.AppendUint16(resp, 0)      // ARCOUNT
+	// Question: example.com AAAA IN
+	resp = append(resp, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0)
+	resp = binary.BigEndian.AppendUint16(resp, 28) // QTYPE=AAAA
+	resp = binary.BigEndian.AppendUint16(resp, 1)  // QCLASS=IN
+	// Answer: compressed name pointer
+	resp = append(resp, 0xC0, 0x0C)                  // name pointer
+	resp = binary.BigEndian.AppendUint16(resp, 28)   // TYPE=AAAA
+	resp = binary.BigEndian.AppendUint16(resp, 1)    // CLASS=IN
+	resp = binary.BigEndian.AppendUint32(resp, 600)  // TTL=600s
+	resp = binary.BigEndian.AppendUint16(resp, 16)   // RDLENGTH=16
+	// 2001:db8::1
+	resp = append(resp, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+
+	ip, ttl, err := parseDNSResponse(resp, 0xBEEF)
+	if err != nil {
+		t.Fatalf("parseDNSResponse AAAA: %v", err)
+	}
+	expected := net.ParseIP("2001:db8::1")
+	if !ip.Equal(expected) {
+		t.Errorf("got IP %v, want 2001:db8::1", ip)
+	}
+	if ttl != 600*time.Second {
+		t.Errorf("got TTL %v, want 600s", ttl)
+	}
+}
+
 // 注：之前的 skipDNSName 单元测试已删除——name compression / 边界检查现在
 // 由 golang.org/x/net/dns/dnsmessage 内部处理，测它的内部状态机意义不大；
 // TestParseDNSResponse 用一个真实的 compressed-pointer 响应做端到端验证。
@@ -289,7 +344,7 @@ func TestStats(t *testing.T) {
 
 func setupTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
-	ns, err := stack.NewNetStack("10.0.0.1", 1500)
+	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
@@ -308,7 +363,7 @@ func setupTestServer(t *testing.T) (*Server, string) {
 
 func dialTest(t *testing.T, addr string) net.Conn {
 	t.Helper()
-	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
 		t.Fatalf("dial %s: %v", addr, err)
 	}
@@ -363,7 +418,7 @@ func TestSOCKS5UnsupportedCommand(t *testing.T) {
 	}
 }
 
-// SK-PROTO-3: IPv6 地址类型应回复 REP=0x08
+// SK-PROTO-3: IPv6 地址类型应被接受处理（不再返回 REP=0x08）
 func TestSOCKS5IPv6Address(t *testing.T) {
 	_, addr := setupTestServer(t)
 	conn := dialTest(t, addr)
@@ -375,15 +430,18 @@ func TestSOCKS5IPv6Address(t *testing.T) {
 
 	// CONNECT + ATYP=0x04 (IPv6) + 16字节地址 + 2字节端口
 	req := []byte{0x05, 0x01, 0x00, 0x04}
-	req = append(req, make([]byte, 16)...) // ::0
+	ipv6Addr := [16]byte{0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	req = append(req, ipv6Addr[:]...)
 	req = append(req, 0x00, 0x50)
 	conn.Write(req)
 
 	resp := make([]byte, 10)
 	io.ReadFull(conn, resp)
-	if resp[1] != socksRepAddrNotSup {
-		t.Errorf("expected REP=0x%02x, got 0x%02x", socksRepAddrNotSup, resp[1])
+	// 不再是 REP=0x08（地址类型不支持），而是尝试连接后返回其他错误码
+	if resp[1] == socksRepAddrNotSup {
+		t.Errorf("IPv6 address should no longer be rejected with REP=0x%02x", socksRepAddrNotSup)
 	}
+	t.Logf("IPv6 address accepted, reply REP=0x%02x", resp[1])
 }
 
 // SK-PROTO-4: 未知地址类型回复 REP=0x08
@@ -508,7 +566,7 @@ func TestSOCKS5ConnectionLimit(t *testing.T) {
 // ===========================================================================
 
 func TestResolveCacheHit(t *testing.T) {
-	ns, err := stack.NewNetStack("10.0.0.1", 1500)
+	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
@@ -529,7 +587,7 @@ func TestResolveCacheHit(t *testing.T) {
 }
 
 func TestResolveCacheMiss(t *testing.T) {
-	ns, err := stack.NewNetStack("10.0.0.1", 1500)
+	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
@@ -549,7 +607,7 @@ func TestResolveCacheMiss(t *testing.T) {
 // ===========================================================================
 
 func TestDumpStats(t *testing.T) {
-	ns, err := stack.NewNetStack("10.0.0.1", 1500)
+	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
@@ -654,8 +712,8 @@ func TestHTTPNonProxyRequest(t *testing.T) {
 	}
 }
 
-// HT-PROTO-3: CONNECT 到非 IPv4 字面量（IPv6）应快速回 502
-func TestHTTPConnectIPv6Rejected(t *testing.T) {
+// HT-PROTO-3: CONNECT 到 IPv6 地址应被处理（dial 失败时回 502）
+func TestHTTPConnectIPv6(t *testing.T) {
 	_, addr := setupTestServer(t)
 	conn := dialTest(t, addr)
 	defer conn.Close()
@@ -667,8 +725,10 @@ func TestHTTPConnectIPv6Rejected(t *testing.T) {
 		t.Fatalf("read response: %v", err)
 	}
 	defer resp.Body.Close()
+	// IPv6 字面量不再被当作"不支持的地址类型"拒绝，而是正常尝试 dial
+	// 在测试环境中 dial 会失败（没有真实目标），所以返回 502
 	if resp.StatusCode != 502 {
-		t.Errorf("expected 502, got %d", resp.StatusCode)
+		t.Errorf("expected 502 (dial failed), got %d", resp.StatusCode)
 	}
 }
 

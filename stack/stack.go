@@ -17,6 +17,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -28,12 +29,13 @@ type NetStack struct {
 	Stack        *stack.Stack
 	Link         *channel.Endpoint
 	TCPKeepalive time.Duration
+	HasIPv6      bool
 }
 
-func NewNetStack(ipAddr string, mtu uint32) (*NetStack, error) {
+func NewNetStack(ip4Addr string, mtu uint32, ip6Addr string) (*NetStack, error) {
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 	})
 
 	link := channel.New(1024, mtu, "")
@@ -41,9 +43,9 @@ func NewNetStack(ipAddr string, mtu uint32) (*NetStack, error) {
 		return nil, fmt.Errorf("create NIC failed: %v", err)
 	}
 
-	ip := net.ParseIP(ipAddr).To4()
+	ip := net.ParseIP(ip4Addr).To4()
 	if ip == nil {
-		return nil, fmt.Errorf("invalid IPv4 address: %s", ipAddr)
+		return nil, fmt.Errorf("invalid IPv4 address: %s", ip4Addr)
 	}
 	addr := tcpip.AddrFrom4([4]byte(ip[:4]))
 
@@ -51,25 +53,61 @@ func NewNetStack(ipAddr string, mtu uint32) (*NetStack, error) {
 		Protocol:          ipv4.ProtocolNumber,
 		AddressWithPrefix: addr.WithPrefix(),
 	}, stack.AddressProperties{}); err != nil {
-		return nil, fmt.Errorf("add address failed: %v", err)
+		return nil, fmt.Errorf("add IPv4 address failed: %v", err)
 	}
 
-	subnet, _ := tcpip.NewSubnet(
+	subnet4, _ := tcpip.NewSubnet(
 		tcpip.AddrFrom4([4]byte{0, 0, 0, 0}),
 		tcpip.MaskFromBytes([]byte{0, 0, 0, 0}),
 	)
-	s.SetRouteTable([]tcpip.Route{{Destination: subnet, NIC: 1}})
+	routes := []tcpip.Route{{Destination: subnet4, NIC: 1}}
 
-	return &NetStack{Stack: s, Link: link}, nil
+	hasV6 := false
+	if ip6Addr != "" {
+		ip6 := net.ParseIP(ip6Addr)
+		if ip6 == nil {
+			return nil, fmt.Errorf("invalid IPv6 address: %s", ip6Addr)
+		}
+		if ip6.To4() != nil {
+			return nil, fmt.Errorf("expected IPv6 address but got IPv4: %s", ip6Addr)
+		}
+		addr6 := tcpip.AddrFrom16([16]byte(ip6.To16()))
+
+		if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{
+			Protocol:          ipv6.ProtocolNumber,
+			AddressWithPrefix: addr6.WithPrefix(),
+		}, stack.AddressProperties{}); err != nil {
+			return nil, fmt.Errorf("add IPv6 address failed: %v", err)
+		}
+
+		subnet6, _ := tcpip.NewSubnet(
+			tcpip.AddrFrom16([16]byte{}),
+			tcpip.MaskFromBytes(make([]byte, 16)),
+		)
+		routes = append(routes, tcpip.Route{Destination: subnet6, NIC: 1})
+		hasV6 = true
+	}
+
+	s.SetRouteTable(routes)
+
+	return &NetStack{Stack: s, Link: link, HasIPv6: hasV6}, nil
+}
+
+func protocolForAddr(addr tcpip.Address) tcpip.NetworkProtocolNumber {
+	if addr.Len() == 4 {
+		return ipv4.ProtocolNumber
+	}
+	return ipv6.ProtocolNumber
 }
 
 func (ns *NetStack) DialTCP(ctx context.Context, addr *tcpip.FullAddress) (net.Conn, error) {
+	proto := protocolForAddr(addr.Addr)
 	if ns.TCPKeepalive <= 0 {
-		return gonet.DialTCPWithBind(ctx, ns.Stack, tcpip.FullAddress{}, *addr, ipv4.ProtocolNumber)
+		return gonet.DialTCPWithBind(ctx, ns.Stack, tcpip.FullAddress{}, *addr, proto)
 	}
 
 	var wq waiter.Queue
-	ep, tcpErr := ns.Stack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	ep, tcpErr := ns.Stack.NewEndpoint(tcp.ProtocolNumber, proto, &wq)
 	if tcpErr != nil {
 		return nil, errors.New(tcpErr.String())
 	}
@@ -114,7 +152,7 @@ func (ns *NetStack) DialTCP(ctx context.Context, addr *tcpip.FullAddress) (net.C
 }
 
 func (ns *NetStack) DialUDP(ctx context.Context, addr *tcpip.FullAddress) (net.Conn, error) {
-	return gonet.DialUDP(ns.Stack, &tcpip.FullAddress{}, addr, ipv4.ProtocolNumber)
+	return gonet.DialUDP(ns.Stack, &tcpip.FullAddress{}, addr, protocolForAddr(addr.Addr))
 }
 
 // Run 在 VPN 管道上运行 gVisor 网络栈。
@@ -288,16 +326,20 @@ func (ns *NetStack) Run(ctx context.Context, input *os.File, output *os.File) er
 		if n < 20 {
 			continue
 		}
-		// 只接收 IPv4。VPN 偶发的 IPv6/其他协议族包丢弃，避免给只注册了 ipv4
-		// 协议的 stack 喂错版本的报文，省掉一次无效 InjectInbound 的 alloc/解析。
-		if pktBuf[0]>>4 != 4 {
+		var proto tcpip.NetworkProtocolNumber
+		switch pktBuf[0] >> 4 {
+		case 4:
+			proto = ipv4.ProtocolNumber
+		case 6:
+			proto = ipv6.ProtocolNumber
+		default:
 			continue
 		}
 		data := bytes.Clone(pktBuf[:n])
 		pk := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(data),
 		})
-		ns.Link.InjectInbound(ipv4.ProtocolNumber, pk)
+		ns.Link.InjectInbound(proto, pk)
 		// NewPacketBuffer 返回时引用计数 = 1（调用方持有）。InjectInbound 内部
 		// 会自己 IncRef 把包交给协议栈处理直到完成；调用方仍要 DecRef 自己那
 		// 一份初始引用，否则入站每个包都会泄漏一个 PacketBuffer 池槽位。

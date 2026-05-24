@@ -430,9 +430,13 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 		targetIP = ip
 
 	case socksAtypIPv6:
-		log.Printf("[socks] %s IPv6 address type not supported", remote)
-		socksReply(conn, socksRepAddrNotSup)
-		return
+		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
+			log.Printf("[socks] %s read IPv6 addr failed: %v", remote, err)
+			return
+		}
+		targetIP = make(net.IP, 16)
+		copy(targetIP, buf[:16])
+		host = targetIP.String()
 
 	default:
 		log.Printf("[socks] %s unknown address type: 0x%02x", remote, buf[3])
@@ -446,15 +450,12 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 	}
 	port := uint16(buf[0])<<8 | uint16(buf[1])
 
-	targetIP4 := targetIP.To4()
-	if targetIP4 == nil {
-		log.Printf("[socks] %s resolved IP %s is not IPv4", remote, targetIP)
-		socksReply(conn, socksRepAddrNotSup)
-		return
+	if v4 := targetIP.To4(); v4 != nil {
+		targetIP = v4
 	}
 
 	// --- 3. Connect via NetStack ---
-	log.Printf("[socks] %s -> %s (%s):%d", remote, host, targetIP4, port)
+	log.Printf("[socks] %s -> %s (%s):%d", remote, host, targetIP, port)
 
 	// 在 dial 前清掉 conn 的握手 deadline。理由：
 	//   - 握手阶段 30s deadline 是绝对时间。dial 自己有 socksDialTimeout=15s。
@@ -467,7 +468,7 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), socksDialTimeout)
 	defer dialCancel()
 
-	tunnel, err := s.dialNetstack(dialCtx, targetIP4, port)
+	tunnel, err := s.dialNetstack(dialCtx, targetIP, port)
 	if err != nil {
 		log.Printf("[socks] %s dial %s:%d failed: %v", remote, host, port, err)
 		socksReply(conn, socksRepHostUnrch)
@@ -490,13 +491,16 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 	log.Printf("[socks] %s -> %s closed, duration=%s in=%d out=%d", remote, host, dur, bytesIn, bytesOut)
 }
 
-// dialNetstack 用解析后的 IPv4 通过 gVisor NetStack 建立 TCP。
-func (s *Server) dialNetstack(ctx context.Context, ip4 net.IP, port uint16) (net.Conn, error) {
-	addr := tcpip.AddrFrom4([4]byte(ip4[:4]))
+func (s *Server) dialNetstack(ctx context.Context, ip net.IP, port uint16) (net.Conn, error) {
+	var addr tcpip.Address
+	if v4 := ip.To4(); v4 != nil {
+		addr = tcpip.AddrFrom4([4]byte(v4))
+	} else {
+		addr = tcpip.AddrFrom16([16]byte(ip.To16()))
+	}
 	return s.ns.DialTCP(ctx, &tcpip.FullAddress{Addr: addr, Port: port})
 }
 
-// resolveAndDial 接受字面量 IP 或域名，解析为 IPv4 后通过 NetStack 建连。
 func (s *Server) resolveAndDial(ctx context.Context, host string, port uint16) (net.Conn, error) {
 	var ip net.IP
 	if parsed := net.ParseIP(host); parsed != nil {
@@ -508,11 +512,10 @@ func (s *Server) resolveAndDial(ctx context.Context, host string, port uint16) (
 		}
 		ip = resolved
 	}
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return nil, fmt.Errorf("%s is not IPv4", ip)
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
 	}
-	return s.dialNetstack(ctx, ip4, port)
+	return s.dialNetstack(ctx, ip, port)
 }
 
 // bidirectionalCopy 在两个连接间双向拷贝，遇到一端 EOF 时半关闭对侧写端。
@@ -597,29 +600,53 @@ func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Durati
 				return v4, dnsCacheFallbackTTL, nil
 			}
 		}
-		return nil, 0, fmt.Errorf("no IPv4 address for %s", name)
+		if s.ns.HasIPv6 {
+			for _, ip := range ips {
+				if ip.To4() == nil && ip.To16() != nil {
+					return ip.To16(), dnsCacheFallbackTTL, nil
+				}
+			}
+		}
+		return nil, 0, fmt.Errorf("no usable IP address for %s", name)
 	}
 
 	start := rand.IntN(len(s.dnsServers))
 	var lastErr error
 	for i := range dnsMaxAttempts {
 		server := s.dnsServers[(start+i)%len(s.dnsServers)]
-		ip, ttl, err := s.dnsQuery(ctx, name, server)
+		ip, ttl, err := s.dnsQueryType(ctx, name, server, dnsmessage.TypeA)
 		if err == nil && ip != nil {
 			return ip, ttl, nil
 		}
-		// rcode 类错误（NXDOMAIN/SERVFAIL/REFUSED）是服务器的明确判定，
-		// 跨服务器或重试拿到不同结果概率极低，直接返回避免浪费 RTT。
 		if errors.Is(err, errDNSRcode) {
-			return nil, 0, err
+			break
 		}
-		// 兜底：dnsQuery 返回 (nil, 0, nil) 不应该发生，但若发生不能让 lastErr
-		// 一直是 nil 而 fall through 到 `return nil, 0, nil`——上层会把 nil IP
-		// 当成正常结果写入缓存，污染后续查询。
 		if err == nil {
 			err = fmt.Errorf("dns query for %q returned no result", name)
 		}
 		lastErr = err
+	}
+
+	if s.ns.HasIPv6 {
+		start = rand.IntN(len(s.dnsServers))
+		for i := range dnsMaxAttempts {
+			server := s.dnsServers[(start+i)%len(s.dnsServers)]
+			ip, ttl, err := s.dnsQueryType(ctx, name, server, dnsmessage.TypeAAAA)
+			if err == nil && ip != nil {
+				return ip, ttl, nil
+			}
+			if errors.Is(err, errDNSRcode) {
+				break
+			}
+			if err == nil {
+				err = fmt.Errorf("dns AAAA query for %q returned no result", name)
+			}
+			lastErr = err
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no usable IP address for %s", name)
 	}
 	return nil, 0, lastErr
 }
@@ -628,30 +655,44 @@ func (s *Server) queryDNS(ctx context.Context, name string) (net.IP, time.Durati
 // DNS 协议实现
 // ---------------------------------------------------------------------------
 
-func (s *Server) dnsQuery(ctx context.Context, name, server string) (net.IP, time.Duration, error) {
+func (s *Server) dnsQueryType(ctx context.Context, name, server string, qtype dnsmessage.Type) (net.IP, time.Duration, error) {
 	dnsAddr := server
 	if !strings.Contains(dnsAddr, ":") {
 		dnsAddr += ":53"
 	}
 	host, portStr, err := net.SplitHostPort(dnsAddr)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid dns server %q: %w", server, err)
+		// IPv6 字面量不带方括号时 SplitHostPort 会失败，尝试加端口重试
+		if ip := net.ParseIP(server); ip != nil {
+			host = server
+			portStr = "53"
+		} else {
+			return nil, 0, fmt.Errorf("invalid dns server %q: %w", server, err)
+		}
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid dns server port %q: %w", portStr, err)
 	}
-	parsed := net.ParseIP(host).To4()
-	if parsed == nil {
+	parsedIP := net.ParseIP(host)
+	if parsedIP == nil {
 		return nil, 0, &net.AddrError{Err: "invalid dns server", Addr: host}
 	}
-	addr := &tcpip.FullAddress{
-		Addr: tcpip.AddrFrom4([4]byte(parsed[:4])),
-		Port: uint16(port),
+	var addr *tcpip.FullAddress
+	if v4 := parsedIP.To4(); v4 != nil {
+		addr = &tcpip.FullAddress{
+			Addr: tcpip.AddrFrom4([4]byte(v4)),
+			Port: uint16(port),
+		}
+	} else {
+		addr = &tcpip.FullAddress{
+			Addr: tcpip.AddrFrom16([16]byte(parsedIP.To16())),
+			Port: uint16(port),
+		}
 	}
 
 	id := uint16(rand.Uint32())
-	query, err := buildDNSQuery(name, id)
+	query, err := buildDNSQuery(name, id, qtype)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -663,8 +704,6 @@ func (s *Server) dnsQuery(ctx context.Context, name, server string) (net.IP, tim
 	resp, tcpErr := s.queryTCP(ctx, addr, query)
 	if tcpErr != nil {
 		if udpErr != nil {
-			// errors.Join (Go 1.20)：保留双侧 error，调用方可用 errors.Is
-			// 穿透到具体 syscall errno（比如 errors.Is(err, context.DeadlineExceeded)）。
 			return nil, 0, errors.Join(
 				fmt.Errorf("udp: %w", udpErr),
 				fmt.Errorf("tcp: %w", tcpErr),
@@ -738,12 +777,7 @@ func (s *Server) queryTCP(ctx context.Context, addr *tcpip.FullAddress, query []
 // 推荐值，能避免 IP 分片同时容纳绝大多数响应。
 const ednsUDPSize = 1232
 
-// buildDNSQuery 构造一个带 EDNS0 OPT 的 A 记录查询。
-//
-// 实现细节用 golang.org/x/net/dns/dnsmessage 的 Builder：标准库附属包，
-// 内部全是 append 不依赖反射，等价于手写但少了 ~80 行 off+10 之类的偏移量
-// 算术，封掉了一整类 buffer overrun bug。
-func buildDNSQuery(name string, id uint16) ([]byte, error) {
+func buildDNSQuery(name string, id uint16, qtype dnsmessage.Type) ([]byte, error) {
 	if name == "" {
 		return nil, fmt.Errorf("empty dns name")
 	}
@@ -766,7 +800,7 @@ func buildDNSQuery(name string, id uint16) ([]byte, error) {
 	}
 	if err := b.Question(dnsmessage.Question{
 		Name:  qname,
-		Type:  dnsmessage.TypeA,
+		Type:  qtype,
 		Class: dnsmessage.ClassINET,
 	}); err != nil {
 		return nil, err
@@ -786,9 +820,6 @@ func buildDNSQuery(name string, id uint16) ([]byte, error) {
 	return b.Finish()
 }
 
-// parseDNSResponse 解析响应，返回第一个 A 记录的 IP + TTL。
-// 用 dnsmessage.Parser 取代手写状态机：CNAME 链、name compression、
-// answer section 边界全由库处理。
 func parseDNSResponse(resp []byte, expectedID uint16) (net.IP, time.Duration, error) {
 	var p dnsmessage.Parser
 	h, err := p.Start(resp)
@@ -799,7 +830,6 @@ func parseDNSResponse(resp []byte, expectedID uint16) (net.IP, time.Duration, er
 		return nil, 0, fmt.Errorf("dns id mismatch")
 	}
 	if h.RCode != dnsmessage.RCodeSuccess {
-		// errDNSRcode 让 queryDNS 能 errors.Is 检测出来 fail-fast。
 		return nil, 0, fmt.Errorf("%w %d", errDNSRcode, int(h.RCode))
 	}
 	if err := p.SkipAllQuestions(); err != nil {
@@ -813,19 +843,26 @@ func parseDNSResponse(resp []byte, expectedID uint16) (net.IP, time.Duration, er
 		if err != nil {
 			return nil, 0, fmt.Errorf("parse answer header: %w", err)
 		}
-		if ah.Type != dnsmessage.TypeA {
-			// CNAME / AAAA / 其他记录跳过。Parser 知道每种 RR 的边界。
+		switch ah.Type {
+		case dnsmessage.TypeA:
+			a, err := p.AResource()
+			if err != nil {
+				return nil, 0, fmt.Errorf("parse A: %w", err)
+			}
+			ip := net.IPv4(a.A[0], a.A[1], a.A[2], a.A[3])
+			return ip, time.Duration(ah.TTL) * time.Second, nil
+		case dnsmessage.TypeAAAA:
+			aaaa, err := p.AAAAResource()
+			if err != nil {
+				return nil, 0, fmt.Errorf("parse AAAA: %w", err)
+			}
+			ip := net.IP(aaaa.AAAA[:])
+			return ip, time.Duration(ah.TTL) * time.Second, nil
+		default:
 			if err := p.SkipAnswer(); err != nil {
 				return nil, 0, fmt.Errorf("skip answer: %w", err)
 			}
-			continue
 		}
-		a, err := p.AResource()
-		if err != nil {
-			return nil, 0, fmt.Errorf("parse A: %w", err)
-		}
-		ip := net.IPv4(a.A[0], a.A[1], a.A[2], a.A[3])
-		return ip, time.Duration(ah.TTL) * time.Second, nil
 	}
-	return nil, 0, fmt.Errorf("no A record in dns response")
+	return nil, 0, fmt.Errorf("no A/AAAA record in dns response")
 }

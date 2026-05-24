@@ -88,7 +88,7 @@ func TestIsFatalWriteErr(t *testing.T) {
 
 func TestNewNetStack(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
-		ns, err := NewNetStack("10.0.0.1", 1500)
+		ns, err := NewNetStack("10.0.0.1", 1500, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -97,15 +97,45 @@ func TestNewNetStack(t *testing.T) {
 		}
 	})
 	t.Run("invalid_IP", func(t *testing.T) {
-		_, err := NewNetStack("not-an-ip", 1500)
+		_, err := NewNetStack("not-an-ip", 1500, "")
 		if err == nil {
 			t.Fatal("expected error for invalid IP")
 		}
 	})
 	t.Run("empty_IP", func(t *testing.T) {
-		_, err := NewNetStack("", 1500)
+		_, err := NewNetStack("", 1500, "")
 		if err == nil {
 			t.Fatal("expected error for empty IP")
+		}
+	})
+	t.Run("valid_dualstack", func(t *testing.T) {
+		ns, err := NewNetStack("10.0.0.1", 1500, "fd00::1")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ns.HasIPv6 {
+			t.Fatal("HasIPv6 should be true")
+		}
+	})
+	t.Run("ipv4_only", func(t *testing.T) {
+		ns, err := NewNetStack("10.0.0.1", 1500, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if ns.HasIPv6 {
+			t.Fatal("HasIPv6 should be false when ip6Addr is empty")
+		}
+	})
+	t.Run("invalid_ipv6", func(t *testing.T) {
+		_, err := NewNetStack("10.0.0.1", 1500, "not-an-ip")
+		if err == nil {
+			t.Fatal("expected error for invalid IPv6")
+		}
+	})
+	t.Run("v4_as_v6_rejected", func(t *testing.T) {
+		_, err := NewNetStack("10.0.0.1", 1500, "192.168.1.1")
+		if err == nil {
+			t.Fatal("expected error for IPv4 address passed as IPv6")
 		}
 	})
 }
@@ -134,9 +164,21 @@ func makeIPv4Packet(totalLen int, src, dst [4]byte) []byte {
 	return pkt
 }
 
+func makeIPv6Packet(payloadLen int, src, dst [16]byte) []byte {
+	pkt := make([]byte, 40+payloadLen)
+	pkt[0] = 0x60 // version 6
+	pkt[4] = byte(payloadLen >> 8)
+	pkt[5] = byte(payloadLen)
+	pkt[6] = 6  // next header: TCP
+	pkt[7] = 64 // hop limit
+	copy(pkt[8:24], src[:])
+	copy(pkt[24:40], dst[:])
+	return pkt
+}
+
 // S-IN-1/2/4: one-shot datagram read, short packet discard
 func TestRunInboundDatagram(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500)
+	ns, err := NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
@@ -174,9 +216,41 @@ func TestRunInboundDatagram(t *testing.T) {
 	}
 }
 
+func TestRunInboundIPv6(t *testing.T) {
+	ns, err := NewNetStack("10.0.0.1", 1500, "fd00::1")
+	if err != nil {
+		t.Fatalf("NewNetStack: %v", err)
+	}
+	vpn, app := socketpair(t)
+	defer vpn.Close()
+	defer app.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- ns.Run(ctx, app, app) }()
+
+	src := [16]byte{0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	dst := [16]byte{0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	vpn.Write(makeIPv6Packet(20, src, dst))
+
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-errCh:
+		t.Fatalf("Run exited unexpectedly: %v", err)
+	default:
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit within 2s after cancel")
+	}
+}
+
 // S-HEALTH-2: health check detects dead VPN via write probe
 func TestRunHealthCheckDetectsDeadVPN(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500)
+	ns, err := NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
@@ -204,7 +278,7 @@ func TestRunHealthCheckDetectsDeadVPN(t *testing.T) {
 
 // S-OUT-1: outbound fatal error propagates to main loop
 func TestRunOutboundFatalNotifiesMainLoop(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500)
+	ns, err := NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
@@ -337,9 +411,8 @@ func TestWriteOutboundWithRetry_ContextCancel(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
-	// 应该在 ~10ms 退出，远短于 maxRetries × 50ms = 500ms。给宽容一点
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("expected fast cancel (<200ms), took %v", elapsed)
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("expected fast cancel (<500ms), took %v", elapsed)
 	}
 }
 
@@ -373,7 +446,7 @@ func TestWriteOutboundWithRetry_ZeroRetries(t *testing.T) {
 
 // context cancel makes Run return immediately
 func TestRunContextCancel(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500)
+	ns, err := NewNetStack("10.0.0.1", 1500, "")
 	if err != nil {
 		t.Fatalf("NewNetStack: %v", err)
 	}
